@@ -3,4 +3,4 @@
 # Group members: Yutong Wu and Zihan Zheng
 
 # Work in progress
-# End goals is to build a inpatient admission prediction model pipeline using data from the last natural year to predict the probability of inpatient admission in this year.
+# End goal is to build a inpatient admission prediction model pipeline using data from the last natural year to predict the probability of inpatient admission in this year.
