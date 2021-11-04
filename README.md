@@ -3,4 +3,4 @@
 # Group members: Yutong Wu and Zihan Zheng
 
 # Work in progress
-# Aim to modify the existing prediction model for High Resource Users (HRU) so that there's no discrimination in the prediction result.
+# End goals is to build a inpatient admission prediction model pipeline using data from the last natural year to predict the probability of inpatient admission in this year.
