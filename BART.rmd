@@ -1,0 +1,383 @@
+---
+title: "BART end-to-end"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### loading utility functions
+source('Util.R')
+```
+
+
+### Data Extraction
+```{r Data Extraction}
+library(DBI)
+library(odbc)
+### extract all data, default time = '201812'
+df_lst <- extractData()
+```
+
+
+### Data Transformation
+```{r Data Transformation}
+library(maditr)
+library(dplyr)
+library(fastDummies)
+
+### columns to drop in strat and history table
+to_drop_strat <- c("Medicare_ID", "first_name", "last_name", "Date of Birth", 
+                   "Medicaid_ID", "Site ID", "IPA_ASSIGN_MO", "Location_DESC", 
+                   "PCP_VST_6MO", "ER_CT", "RISK_DESC", "RISK_ROLLUP",
+                   "PRISM_CURR", "RSN_BH_IND", "IShCN_BH", "ISHCN_HOUSING", 
+                   "Engagement", "BP_COC_INDEX", "RUN_MO", "AV_ER_CT", 
+                   "orig_member_id", "SNP_LEVEL", "CHPW_SNP_Level", "current_pcp",
+                   "PHQ9_LEVEL")
+
+to_drop_history <- c("member_id", "Medicaid_ID", "medicare_id", "first_name", 
+                     "last_name", "dob", "address_line1", "state", "zip",
+                     "home_phone_number", "location_desc", "orig_location_id",
+                     "Plan Name", "FIMC", "MIN_ENROLL", "calendar_YM", "Ethnicity",
+                     "orig_member_id", "ACH_Region", "BHO_Region", "PHQ9_DATE",
+                     "PHQ9_SCORE", "PHQ9_LEVEL", "Enrolled_Date", "city", "zip", 
+                     "county", "current_pcp", "Location", "Site ID")
+
+
+### final df:
+df <- transformData(df_lst, to_drop_strat, to_drop_history)
+```
+### Exploration
+```{r EDA}
+race.eda <- data.frame(
+  n = sapply(select(df,contains("race")), sum),
+  IP = sapply(select(df[df$IP_IND == 1,],contains("race")), sum),
+  n.pct = sapply(select(df,contains("race")), sum) / nrow(df),
+  IP.pct = sapply(select(df[df$IP_IND == 1,],contains("race")), sum) / sum(df$IP_IND == 1),
+  race = substr(names(df)[78:85],start = 6, stop = 100),
+  row.names = NULL
+)
+
+race.eda$IP.prop <- race.eda$IP/race.eda$n
+```
+
+
+```{r EDA plotting}
+library(ggplot2)
+
+### class inbalance
+tiff("classBarplot.jpg", units="in", width=5, height=5, res=300)
+df %>% ggplot(aes(x = as.factor(IP_IND), fill=as.factor(IP_IND))) + 
+  geom_bar() +
+  labs(title = 'Distribution of Outcome Group') +
+  scale_fill_manual(values = c('#1E88E5', '#D81B60')) +
+  theme_classic() + 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        legend.position = "none")
+dev.off()
+
+### barplots for distribution of race
+tiff("overRaceBarplot.jpg", units="in", width=7, height=4, res=300)
+race.eda %>% ggplot(aes(x = race, y = n)) + 
+  geom_bar(stat = 'identity', fill = 'lavender') +
+  coord_flip() + 
+  geom_text(aes(label = scales::percent(n.pct, accuracy = 0.1)), hjust = 'inward') + 
+  labs(title = 'Distribution of Races in all Data') +
+  theme_classic() + 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+
+tiff("IPRaceBarplot.jpg", units="in", width=7, height=4, res=300)
+race.eda %>% ggplot(aes(x = race, y = IP)) + 
+  geom_bar(stat = 'identity', fill = 'lavender') +
+  coord_flip() + 
+  geom_text(aes(label = scales::percent(IP.pct, accuracy = 0.1)), hjust = 'inward') + 
+  labs(title = 'Distribution of Races in Positive Outcome Group') +
+  theme_classic() + 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+dev.off()
+
+### barplot for proportion of inpatient admission in each race
+tiff("IPPropByRaceBarplot.jpg", units="in", width=7, height=4, res=300)
+race.eda %>% ggplot(aes(x = race, y = IP.prop)) + 
+  geom_bar(stat = 'identity', fill = 'lavender') +
+  coord_flip() + 
+  geom_text(aes(label = scales::percent(IP.prop, accuracy = 0.1)), hjust = 'inward') + 
+  labs(title = 'Event Rate by Race') +
+  theme_classic() + 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+dev.off()
+
+```
+
+
+
+
+### Data Partitioning
+```{r Data Partitioning}
+library(caret)
+
+### set random seed
+set.seed(2022)
+
+
+### shuffle the data, then partition into train, test, X, and y.
+df <- df[sample(1:nrow(df)), ]
+train_idx <- createDataPartition(y = 1:nrow(df), p = 0.8, list = FALSE)
+train_dat <- df[train_idx, ]
+test_dat <- df[-train_idx, ]
+X_train <- train_dat %>% select(-MBR_NO, -IP_IND)
+X_test <- test_dat %>% select(-MBR_NO, -IP_IND)
+y_train <- train_dat$IP_IND %>% factor(., c(1,0))
+y_test <- test_dat$IP_IND %>% factor(., c(1,0))
+```
+
+
+### BART Base Model
+```{r BART}
+### Allocate memories and set number of cores for parallel computing
+# Setting the seed when using parallelization does not result in deterministic output.
+options(java.parameters = "-Xmx20g")
+library(bartMachine)
+set_bart_machine_num_cores(4) 
+library(MLmetrics)
+
+
+### fit model
+bart.base <- bartMachine(X = X_train, 
+                          y = y_train,
+                          run_in_sample = FALSE,
+                          mem_cache_for_speed = FALSE,
+                          flush_indices_to_save_RAM = TRUE,
+                          #serialize = TRUE,
+                          #seed = 2022,
+                          verbose = TRUE)
+
+
+### predict probability
+bart.base.train.p <- predict(bart.base, new_data = X_train)
+bart.base.test.p <- predict(bart.base, new_data = X_test)
+
+
+### predict label that matches prevalence
+bart.base.train.y <- factor(as.numeric(bart.base.train.p >= quantile(bart.base.train.p, 1-mean(y_train==1))), c(1,0))
+bart.base.test.y <- factor(as.numeric(bart.base.test.p >= quantile(bart.base.test.p, 1-mean(y_test==1))), c(1,0))
+
+
+### evaluation
+confusionMatrix(bart.base.train.y, y_train, positive = '1', mode = 'everything')
+confusionMatrix(bart.base.test.y, y_test, positive = '1', mode = 'everything')
+```
+
+
+### BART Tuning: Grid Search with Cross Validation
+```{r BART CV}
+### set parameter grid
+param_grid <- list(k = c(2,3,5), m = c(50,100,150,200))
+
+### grid search with cv
+GS.res <- bartGridSearch(X_train, y_train, param_grid = param_grid)
+knitr::kable(GS.res[order(GS.res$cv_scores, decreasing = TRUE),])
+
+### store best parameters
+best_params <- GS.res[order(GS.res$cv_scores, decreasing = TRUE),1:2][1,]
+```
+
+
+### BART Final Model
+```{r BART final}
+### fit model using best parameters found by CV
+bart.final <- bartMachine(X = X_train, 
+                          y = y_train,
+                          k = best_params$k,
+                          num_trees = best_params$m,
+                          run_in_sample = FALSE,
+                          mem_cache_for_speed = FALSE,
+                          flush_indices_to_save_RAM = TRUE,
+                          #serialize = TRUE,
+                          #seed = 2022,
+                          verbose = TRUE)
+
+
+### predict probability
+bart.final.train.p <- predict(bart.final, new_data = X_train)
+bart.final.test.p <- predict(bart.final, new_data = X_test)
+
+
+### predict label that matches prevalence
+bart.final.train.y <- factor(as.numeric(bart.final.train.p >= quantile(bart.final.train.p, 1-mean(y_train==1))), c(1,0))
+bart.final.test.y <- factor(as.numeric(bart.final.test.p >= quantile(bart.final.test.p, 1-mean(y_test==1))), c(1,0))
+
+### evaluation
+confusionMatrix(bart.final.train.y, y_train, positive = '1', mode = 'everything')
+confusionMatrix(bart.final.test.y, y_test, positive = '1', mode = 'everything')
+
+### CI for eval metrics
+conf.mat <- confusionMatrix(bart.final.test.y, y_test, positive = '1', mode = 'everything')$table
+knitr::kable(metricCI(conf.mat))
+```
+
+### CND
+```{r}
+CND.res <- cndMassageData(train_dat, bart.final.train.p)
+train_dat.new <- CND.res$data.new
+race.table <- CND.res$race.comparison
+knitr::kable(race.table)
+```
+
+
+### BART after CND
+```{r CND}
+### get new training X and y
+X_train.new <- train_dat.new %>% select(-MBR_NO, -IP_IND)
+y_train.new <- train_dat.new$IP_IND %>% factor(., c(1,0))
+
+### fit model
+bart.final.CND <- bartMachine(X = X_train.new, 
+                              y = y_train.new,
+                              k = best_params$k,
+                              num_trees = best_params$m,
+                              run_in_sample = FALSE,
+                              mem_cache_for_speed = FALSE,
+                              flush_indices_to_save_RAM = TRUE,
+                              #serialize = TRUE,
+                              #seed = 2022,
+                              verbose = TRUE)
+
+### predict probability
+bart.final.CND.train.p <- predict(bart.final.CND, new_data = X_train.new)
+bart.final.CND.test.p <- predict(bart.final.CND, new_data = X_test)
+
+
+### predict label that matches prevalence
+bart.final.CND.train.y <- factor(as.numeric(bart.final.CND.train.p >= quantile(bart.final.CND.train.p, 1-mean(y_train==1))), c(1,0))
+bart.final.CND.test.y <- factor(as.numeric(bart.final.CND.test.p >= quantile(bart.final.CND.test.p, 1-mean(y_test==1))), c(1,0))
+
+
+### evaluation
+confusionMatrix(bart.final.CND.train.y, y_train.new, positive = '1', mode = 'everything')
+confusionMatrix(bart.final.CND.test.y, y_test, positive = '1', mode = 'everything')
+
+### CI for eval metrics
+conf.mat.final <- confusionMatrix(bart.final.CND.test.y, y_test, positive = '1', mode = 'everything')$table
+knitr::kable(metricCI(conf.mat))
+```
+
+
+### CND Results on Racial Bias
+```{r eval CND train}
+### training data
+CND.table.train <- compareRaceCND(train_dat, bart.final.train.y, bart.final.CND.train.y)
+knitr::kable(CND.table.train)
+```
+
+
+
+```{r eval CND test}
+### test data
+CND.table.test <- compareRaceCND(test_dat, bart.final.test.y, bart.final.CND.test.y)
+knitr::kable(CND.table.test)
+
+### plot predicted incidence rate by race, before and after CND
+CND.table.test$before.prop <- CND.table.test$before/CND.table.test$overall
+CND.table.test$after.prop <- CND.table.test$after/CND.table.test$overall
+
+tiff("biasBefore.jpg", units="in", width=7, height=4, res=300)
+CND.table.test %>% filter(races != 'Total') %>%
+  ggplot(aes(x = races, y = before.prop)) + 
+  geom_bar(stat = 'identity', fill = 'lavender') +
+  coord_flip() + 
+  geom_text(aes(label = scales::percent(before.prop, accuracy = 0.1)), hjust = 'inward') + 
+  labs(title = 'Predicted Event Rate Before CND') +
+  theme_classic() + 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+tiff("biasafter.jpg", units="in", width=7, height=4, res=300)
+CND.table.test %>% filter(races != 'Total') %>%
+  ggplot(aes(x = races, y = after.prop)) + 
+  geom_bar(stat = 'identity', fill = 'lavender') +
+  coord_flip() + 
+  geom_text(aes(label = scales::percent(after.prop, accuracy = 0.1)), hjust = 'inward') + 
+  labs(title = 'Predicted Event Rate After CND') +
+  theme_classic() + 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+CND.table.test %>% filter(races != 'Total') %>% ggplot(aes(x = races, y = expected-before)) +
+  geom_bar(stat = 'identity') +
+  coord_flip()
+
+
+dev.off()
+```
+
+```{r prop test}
+prop.test(x=CND.table.test$actual[-9], n=CND.table.test$overall[-9])
+prop.test(x=CND.table.test$before[-9], n=CND.table.test$overall[-9])
+prop.test(x=CND.table.test$after[-9], n=CND.table.test$overall[-9])
+
+```
+
+```{r feature importance}
+### feature importance plots for the final model
+par(mar = c(1,1,1,1))
+investigate_var_importance(bart.final.CND, num_var_plot = 20, type = 'trees')
+feat.imp <- investigate_var_importance(bart.final.CND, num_var_plot = 20, type = 'splits')
+
+feat.imp.df <- data.frame(mean.prop = feat.imp$avg_var_props,
+                          sd.prop = feat.imp$sd_var_props,
+                          feature = names(feat.imp$avg_var_props),
+                          row.names = NULL) 
+
+tiff("bartImportance.jpg", units="in", width=7, height=4, res=300)
+
+feat.imp.df %>% slice_max(mean.prop, n=10) %>%
+  ggplot(aes(x = reorder(feature, +mean.prop), y = mean.prop)) + 
+  geom_bar(stat = 'identity', fill = 'lightblue') +
+  coord_flip() +
+  theme_classic() + 
+  scale_y_continuous(name="Proportion of Inclusion in Tree Splits") +
+  scale_x_discrete(name="Variable Name")
+
+dev.off()
+```
+
+```{r save tables}
+### tables comparing results before and after CND
+write.csv(compareRaceCND(train_dat, bart.final.train.y, bart.final.CND.train.y), 
+          file = 'compare_CND_train.csv')
+write.csv(compareRaceCND(test_dat, bart.final.test.y, bart.final.CND.test.y), 
+          file = 'compare_CND_test.csv')
+
+### confusion matrices and evaluation metrics after CND
+write.csv(confusionMatrix(bart.final.CND.train.y, y_train.new, positive = '1', mode = 'everything')$table,
+          file = 'confusion_CND_train.csv')
+write.csv(confusionMatrix(bart.final.CND.train.y, y_train.new, positive = '1', mode = 'everything')$byClass,
+          file = 'eval_metrics_CND_train.csv')
+write.csv(confusionMatrix(bart.final.CND.test.y, y_test, positive = '1', mode = 'everything')$table,
+          file = 'confusion_CND_test.csv')
+write.csv(confusionMatrix(bart.final.CND.test.y, y_test, positive = '1', mode = 'everything')$byClass,
+          file = 'eval_metrics_CND_test.csv')
+
+### race comparison table in CND
+write.csv(race.table, file = 'CND_race.csv')
+
+### confusion matrices and evaluation metrics before CND
+write.csv(confusionMatrix(bart.final.train.y, y_train, positive = '1', mode = 'everything')$table,
+          file = 'confusion_train.csv')
+write.csv(confusionMatrix(bart.final.train.y, y_train, positive = '1', mode = 'everything')$byClass,
+          file = 'eval_metrics_train.csv')
+write.csv(confusionMatrix(bart.final.test.y, y_test, positive = '1', mode = 'everything')$table,
+          file = 'confusion_test.csv')
+write.csv(confusionMatrix(bart.final.test.y, y_test, positive = '1', mode = 'everything')$byClass,
+          file = 'eval_metrics_test.csv')
+
+### tuning result
+write.csv(GS.res, file = 'tuning.csv')
+```
+
